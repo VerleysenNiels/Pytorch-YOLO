@@ -1,5 +1,7 @@
 from __future__ import division
 
+from utils import *
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -169,6 +171,184 @@ def create_modules(blocks):
     return (net_info, module_list)
 
 
-# TEST
+# TEST parsing and network structure creation
 # blocks = parse_configuration("cfg/yolov3.cfg.txt")
 # print(create_modules(blocks))
+
+
+"""
+Network class (Subclass of nn.Module)
+"""
+class Network(nn.Module):
+    # Constructor
+    def __init__(self, configuration):
+        super(Network, self).__init__()
+        self.blocks = parse_configuration(configuration)
+        self.net_info, self.module_list = create_modules(self.blocks)
+
+    # Forward pass of the network
+    def forward(self, inputs, CUDA):
+        modules = self.blocks[1:]
+        outputs = {}  # Cache of outputs for the route layers
+
+        # How many detections were made by YOLO layer
+        write = 0
+
+        # Intermediate result
+        x = inputs
+
+        # Loop over modules in the network
+        for i, module in enumerate(modules):
+            module_type = (module["type"])
+
+            # Just do general forward pass for convolutional and upsampling layers
+            if module_type == "convolutional" or module_type == "upsample":
+                x = self.module_list[i](x)
+
+            # Route layer
+            elif module_type == "route":
+                layers = module["layers"]
+                layers = [int(a) for a in layers]
+
+                if (layers[0]) > 0:
+                    layers[0] = layers[0] - i
+
+                # Route comes from single layer
+                if len(layers) == 1:
+                    x = outputs[i + (layers[0])]
+
+                # Route comes from two layers (concatenate 2 feature maps)
+                else:
+                    if (layers[1]) > 0:
+                        layers[1] = layers[1] - i
+
+                    map1 = outputs[i + layers[0]]
+                    map2 = outputs[i + layers[1]]
+
+                    x = torch.cat((map1, map2), 1)
+
+            # Skip connection
+            elif module_type == "shortcut":
+                origin = int(module["from"])
+                x = outputs[i - 1] + outputs[i + origin]
+
+            # YOLO layer
+            elif module_type == 'yolo':
+                # Get anchors
+                anchors = self.module_list[i][0].anchors
+
+                # Get input dimensions
+                inp_dim = int(self.net_info["height"])
+
+                # Get number of classes
+                num_classes = int(module["classes"])
+
+                # Transform prediction to a more usable structure
+                x = x.data
+                x = prediction_transform(x, inp_dim, anchors, num_classes, CUDA)
+
+                # Were any detections made yet?
+                if not write:
+                    # Init tensor with detections
+                    detections = x
+                    write = 1
+                else:
+                    # Add detection to tensor with all detections
+                    detections = torch.cat((detections, x), 1)
+                    write += 1
+
+            # Add output of this layer to cache
+            outputs[i] = x
+
+        return detections
+
+    # Load in (pre-)trained weights
+    def load_weights(self, file):
+        content = open(file, "rb")
+
+        # First 5 values are header information
+        header = np.fromfile(content, dtype=np.int32, count=5)
+        self.header = torch.from_numpy(header)
+        self.seen = self.header[3]
+
+        # Actual weights
+        weights = np.fromfile(content, dtype=np.float32)
+
+        index = 0
+        for i in range(len(self.module_list)):
+            module_type = self.blocks[i + 1]["type"]
+
+            # If module_type is convolutional load weights
+            if module_type == "convolutional":
+                model = self.module_list[i]
+
+                # Check if batch normalization is enabled
+                try:
+                    batch_normalize = int(self.blocks[i + 1]["batch_normalize"])
+                except:
+                    batch_normalize = 0
+
+                conv = model[0]
+
+                # Load weights for a convolutional layer with batch normalization
+                if (batch_normalize):
+                    bn = model[1]
+
+                    # Get the number of weights of Batch Norm Layer
+                    num_bn_biases = bn.bias.numel()
+
+                    # Load the weights
+                    # 1. Biases
+                    bn_biases = torch.from_numpy(weights[index: index + num_bn_biases])
+                    index += num_bn_biases
+
+                    # 2. Actual weights
+                    bn_weights = torch.from_numpy(weights[index: index + num_bn_biases])
+                    index += num_bn_biases
+
+                    # 3. Running mean
+                    bn_running_mean = torch.from_numpy(weights[index: index + num_bn_biases])
+                    index += num_bn_biases
+
+                    # 4. Running var
+                    bn_running_var = torch.from_numpy(weights[index: index + num_bn_biases])
+                    index += num_bn_biases
+
+                    # Cast weights to dimensions of model weights.
+                    bn_biases = bn_biases.view_as(bn.bias.data)
+                    bn_weights = bn_weights.view_as(bn.weight.data)
+                    bn_running_mean = bn_running_mean.view_as(bn.running_mean)
+                    bn_running_var = bn_running_var.view_as(bn.running_var)
+
+                    # Copy the weights to model
+                    bn.bias.data.copy_(bn_biases)
+                    bn.weight.data.copy_(bn_weights)
+                    bn.running_mean.copy_(bn_running_mean)
+                    bn.running_var.copy_(bn_running_var)
+
+                # Load weights for a convolutional layer without batch normalization
+                else:
+                    # Number of biases
+                    num_biases = conv.bias.numel()
+
+                    # Load weights
+                    conv_biases = torch.from_numpy(weights[index: index + num_biases])
+                    index = index + num_biases
+
+                    # Reshape loaded weights according to dimensions of the model weights
+                    conv_biases = conv_biases.view_as(conv.bias.data)
+
+                    # Finally copy the data
+                    conv.bias.data.copy_(conv_biases)
+
+                # Load weights of Convolutional layer itself
+                # Get number of weights
+                num_weights = conv.weight.numel()
+
+                # Load weights
+                conv_weights = torch.from_numpy(weights[index:index + num_weights])
+                index = index + num_weights
+
+                # Reshape dimensions of loaded weights
+                conv_weights = conv_weights.view_as(conv.weight.data)
+                conv.weight.data.copy_(conv_weights)
