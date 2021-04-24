@@ -198,3 +198,30 @@ def write_results(prediction, confidence_threshold, num_classes, nms_conf = 0.4)
         return output
     except:
         return 0
+
+
+"""
+Resize image
+"""
+def resize_image(img, inp_dim):
+    img_width, img_height = img.shape[1], img.shape[0]
+    width, height = inp_dim
+    new_width = int(img_width * min(width / img_width, height / img_height))
+    new_height = int(img_height * min(width / img_width, height / img_height))
+    resized_image = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+
+    canvas = np.full((inp_dim[1], inp_dim[0], 3), 128)
+
+    canvas[(height - new_height) // 2:(height - new_height) // 2 + new_height, (width - new_width) // 2:(width - new_width) // 2 + new_width, :] = resized_image
+
+    return canvas
+
+
+"""
+Prepare image as input for the network
+"""
+def prepare_image(img, inp_dim):
+    img = cv2.resize(img, (inp_dim, inp_dim))
+    img = img[:, :, ::-1].transpose((2, 0, 1)).copy()
+    img = torch.from_numpy(img).float().div(255.0).unsqueeze(0)
+    return img
